@@ -6,6 +6,9 @@ from datetime import datetime, timezone
 import httpx
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# httpx logs every request at INFO — noisy on Railway; keep only warnings+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
@@ -22,7 +25,9 @@ SPIKE_INTERVAL   = 15          # seconds between spike scans
 MAX_CONCURRENT   = 10          # parallel requests
 COOLDOWN_SEC     = 600         # don't re-alert same coin+signal within 10 min
 
-BINANCE_BASE = "https://fapi.binance.com"
+# Override if mainnet is blocked from your host (e.g. HTTP 451 on Railway): e.g.
+# https://testnet.binancefuture.com for Futures testnet (dev only).
+BINANCE_BASE = os.environ.get("BINANCE_FAPI_BASE", "https://fapi.binance.com").rstrip("/")
 
 # ── Cooldown tracker ──────────────────────────────────────────────────────────
 _cooldowns: dict[str, float] = {}
@@ -35,19 +40,51 @@ def set_cooldown(key: str):
     _cooldowns[key] = time.time()
 
 
+def _raise_binance_http_error(r: httpx.Response, path: str) -> None:
+    snippet = (r.text or "")[:800]
+    if r.status_code == 451:
+        raise RuntimeError(
+            "Binance Futures returned HTTP 451 (Unavailable For Legal Reasons) for "
+            f"{path}. Your server's IP is likely in a region where Binance blocks "
+            "Futures API access (common on cloud hosts like Railway). Options: deploy "
+            "to a VPS in an allowed region, route traffic through an allowed proxy, "
+            "or for testing set env BINANCE_FAPI_BASE=https://testnet.binancefuture.com "
+            "(testnet only; not real funds)."
+        )
+    raise RuntimeError(
+        f"Binance API HTTP {r.status_code} for {path}: {snippet}"
+    )
+
+
 # ── Binance Futures helpers ───────────────────────────────────────────────────
 async def get_futures_symbols(client: httpx.AsyncClient) -> list[str]:
-    r = await client.get(f"{BINANCE_BASE}/fapi/v1/exchangeInfo", timeout=20)
+    path = "/fapi/v1/exchangeInfo"
+    r = await client.get(f"{BINANCE_BASE}{path}", timeout=20)
+    if r.status_code != 200:
+        _raise_binance_http_error(r, path)
     data = r.json()
+    symbols = data.get("symbols")
+    if not isinstance(symbols, list):
+        raise RuntimeError(
+            "Unexpected exchangeInfo payload (no 'symbols' list). "
+            f"BINANCE_FAPI_BASE={BINANCE_BASE!r} body preview: {(r.text or '')[:400]!r}"
+        )
     syms = [
-        s["symbol"] for s in data["symbols"]
+        s["symbol"] for s in symbols
         if s["status"] == "TRADING" and s["quoteAsset"] == "USDT"
     ]
     return syms
 
 async def get_24h_volume(client: httpx.AsyncClient, symbols: list[str]) -> dict[str, float]:
-    r = await client.get(f"{BINANCE_BASE}/fapi/v1/ticker/24hr", timeout=20)
+    path = "/fapi/v1/ticker/24hr"
+    r = await client.get(f"{BINANCE_BASE}{path}", timeout=20)
+    if r.status_code != 200:
+        _raise_binance_http_error(r, path)
     tickers = r.json()
+    if not isinstance(tickers, list):
+        raise RuntimeError(
+            f"Unexpected 24hr ticker payload from {path}. BINANCE_FAPI_BASE={BINANCE_BASE!r}"
+        )
     return {t["symbol"]: float(t["quoteVolume"]) for t in tickers if t["symbol"] in symbols}
 
 async def get_klines(client: httpx.AsyncClient, symbol: str, interval: str, limit: int = 60) -> list[dict]:
