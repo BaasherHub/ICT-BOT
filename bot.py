@@ -14,7 +14,7 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 # ── Config ────────────────────────────────────────────────────────────────────
-SPIKE_THRESHOLD  = 3.0        # % move to trigger alert
+SPIKE_THRESHOLD  = 5.0        # % move to trigger alert
 MIN_VOLUME_USDT  = 5_000_000  # ignore low-volume coins
 SPIKE_INTERVAL   = 15         # seconds between scans
 MAX_CONCURRENT   = 10
