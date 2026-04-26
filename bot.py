@@ -14,11 +14,12 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 # ── Config ────────────────────────────────────────────────────────────────────
-SPIKE_THRESHOLD  = 5.0        # % move to trigger alert
+SPIKE_THRESHOLD  = 5.0        # % move to trigger alert (based on 24h priceChangePercent)
 MIN_VOLUME_USDT  = 5_000_000  # ignore low-volume coins
-SPIKE_INTERVAL   = 15         # seconds between scans
-MAX_CONCURRENT   = 10
+SPIKE_INTERVAL   = 30         # seconds between scans (was 15 — doubled to halve egress)
+MAX_CONCURRENT   = 5          # parallel kline fetches (reduced from 10)
 COOLDOWN_SEC     = 600        # 10 min cooldown per coin per direction
+PRE_FILTER_PCT   = 2.0        # only fetch klines if 24h change > this % (bulk filter)
 
 BINANCE_BASE = os.environ.get("BINANCE_FAPI_BASE", "https://fapi.binance.com").rstrip("/")
 
@@ -34,10 +35,7 @@ def set_cooldown(key: str):
 # ── Binance helpers ───────────────────────────────────────────────────────────
 def _raise_if_error(r: httpx.Response, path: str):
     if r.status_code == 451:
-        raise RuntimeError(
-            f"Binance returned HTTP 451 for {path}. "
-            "Your Railway region may be blocked. Set env BINANCE_FAPI_BASE to a proxy."
-        )
+        raise RuntimeError(f"Binance returned HTTP 451 for {path}. Set env BINANCE_FAPI_BASE to a proxy.")
     if r.status_code != 200:
         raise RuntimeError(f"Binance HTTP {r.status_code} for {path}: {r.text[:200]}")
 
@@ -50,11 +48,15 @@ async def get_futures_symbols(client: httpx.AsyncClient) -> list[str]:
         if s["status"] == "TRADING" and s["quoteAsset"] == "USDT"
     ]
 
-async def get_24h_volume(client: httpx.AsyncClient, symbols: list[str]) -> dict[str, float]:
+async def get_bulk_tickers(client: httpx.AsyncClient) -> list[dict]:
+    """
+    ONE request for ALL symbols — returns priceChangePercent, quoteVolume, lastPrice.
+    This replaces per-symbol kline fetches as a pre-filter.
+    """
     path = "/fapi/v1/ticker/24hr"
     r = await client.get(f"{BINANCE_BASE}{path}", timeout=20)
     _raise_if_error(r, path)
-    return {t["symbol"]: float(t["quoteVolume"]) for t in r.json() if t["symbol"] in symbols}
+    return r.json()
 
 async def get_klines(client: httpx.AsyncClient, symbol: str, interval: str, limit: int) -> list[dict]:
     r = await client.get(
@@ -72,42 +74,39 @@ async def get_klines(client: httpx.AsyncClient, symbol: str, interval: str, limi
 # ── Spike detection ───────────────────────────────────────────────────────────
 sem = asyncio.Semaphore(MAX_CONCURRENT)
 
-async def scan_spike(client: httpx.AsyncClient, symbol: str) -> dict | None:
+async def scan_spike_klines(client: httpx.AsyncClient, symbol: str, rough_pct: float) -> dict | None:
+    """
+    Only called for coins already passing the bulk pre-filter.
+    Fetches klines on 1m only (was 1m+5m+15m — 3x fewer requests).
+    """
     try:
         async with sem:
-            c1, c5, c15 = await asyncio.gather(
-                get_klines(client, symbol, "1m",  5),
-                get_klines(client, symbol, "5m",  4),
-                get_klines(client, symbol, "15m", 3),
-            )
+            c1 = await get_klines(client, symbol, "1m", 5)
 
-        for tf, candles, lookback in [("1m", c1, 3), ("5m", c5, 2), ("15m", c15, 2)]:
-            if len(candles) < lookback + 1:
-                continue
+        if len(c1) < 4:
+            return None
 
-            recent   = candles[-(lookback + 1):]
-            base     = recent[0]["o"]
-            high     = max(c["h"] for c in recent[1:])
-            low      = min(c["l"] for c in recent[1:])
-            last_c   = recent[-1]["c"]
-            pump_pct = (high  - base) / base * 100
-            dump_pct = (base  - low)  / base * 100
+        base   = c1[0]["o"]
+        high   = max(c["h"] for c in c1[1:])
+        low    = min(c["l"] for c in c1[1:])
+        last_c = c1[-1]["c"]
 
-            if pump_pct >= SPIKE_THRESHOLD:
-                key = f"{symbol}:pump:{tf}"
-                if not is_cooled(key):
-                    set_cooldown(key)
-                    return {"symbol": symbol, "bias": "SHORT", "tf": tf,
-                            "pct": pump_pct, "entry": last_c, "dir": "PUMP",
-                            "high": high}
+        pump_pct = (high - base) / base * 100
+        dump_pct = (base - low)  / base * 100
 
-            if dump_pct >= SPIKE_THRESHOLD:
-                key = f"{symbol}:dump:{tf}"
-                if not is_cooled(key):
-                    set_cooldown(key)
-                    return {"symbol": symbol, "bias": "LONG", "tf": tf,
-                            "pct": dump_pct, "entry": last_c, "dir": "DUMP",
-                            "low": low}
+        if pump_pct >= SPIKE_THRESHOLD:
+            key = f"{symbol}:pump:1m"
+            if not is_cooled(key):
+                set_cooldown(key)
+                return {"symbol": symbol, "bias": "SHORT", "tf": "1m",
+                        "pct": pump_pct, "entry": last_c, "dir": "PUMP", "high": high}
+
+        if dump_pct >= SPIKE_THRESHOLD:
+            key = f"{symbol}:dump:1m"
+            if not is_cooled(key):
+                set_cooldown(key)
+                return {"symbol": symbol, "bias": "LONG", "tf": "1m",
+                        "pct": dump_pct, "entry": last_c, "dir": "DUMP", "low": low}
 
     except Exception as e:
         log.debug(f"Spike scan error {symbol}: {e}")
@@ -151,29 +150,51 @@ def format_spike(sig: dict) -> str:
     ])
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
-async def spike_loop(symbols: list[str]):
-    log.info(f"Spike loop started — {len(symbols)} symbols")
-    symbols_ts = time.time()
+async def main():
+    log.info("Spike Bot (optimized) starting...")
+
+    await send_telegram(
+        f"Spike Bot started (optimized)\n"
+        f"Threshold: {SPIKE_THRESHOLD}%+ move\n"
+        f"Pre-filter: only fetch klines if 24h change > {PRE_FILTER_PCT}%\n"
+        f"Scan every {SPIKE_INTERVAL}s — cooldown {COOLDOWN_SEC//60}min per alert"
+    )
+
+    symbols_ts = 0
+    all_symbols: set[str] = set()
 
     while True:
         start = time.time()
 
-        # Refresh symbol list every hour
-        if time.time() - symbols_ts > 3600:
-            try:
-                async with httpx.AsyncClient(timeout=20) as client:
-                    new_syms = await get_futures_symbols(client)
-                    vols     = await get_24h_volume(client, new_syms)
-                symbols   = [s for s in new_syms if vols.get(s, 0) >= MIN_VOLUME_USDT]
-                symbols.sort(key=lambda s: vols.get(s, 0), reverse=True)
-                symbols_ts = time.time()
-                log.info(f"Symbols refreshed: {len(symbols)}")
-            except Exception as e:
-                log.warning(f"Symbol refresh failed: {e}")
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                # Refresh allowed symbol list hourly
+                if time.time() - symbols_ts > 3600:
+                    all_symbols = set(await get_futures_symbols(client))
+                    symbols_ts  = time.time()
+                    log.info(f"Symbols refreshed: {len(all_symbols)}")
 
-        async with httpx.AsyncClient(timeout=15) as client:
-            tasks   = [scan_spike(client, s) for s in symbols]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+                # ONE bulk request — replaces N*3 kline requests per cycle
+                tickers = await get_bulk_tickers(client)
+
+            # Pre-filter: only candidates with sufficient volume AND recent move
+            candidates = [
+                t for t in tickers
+                if t["symbol"] in all_symbols
+                and float(t.get("quoteVolume", 0)) >= MIN_VOLUME_USDT
+                and abs(float(t.get("priceChangePercent", 0))) >= PRE_FILTER_PCT
+            ]
+            log.info(f"Pre-filter: {len(candidates)} candidates from {len(tickers)} symbols")
+
+            # Now fetch klines only for pre-filtered candidates
+            async with httpx.AsyncClient(timeout=15) as client:
+                tasks   = [scan_spike_klines(client, t["symbol"], float(t["priceChangePercent"])) for t in candidates]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        except Exception as e:
+            log.warning(f"Scan error: {e}")
+            await asyncio.sleep(SPIKE_INTERVAL)
+            continue
 
         spikes = [r for r in results if r and not isinstance(r, Exception)]
         log.info(f"Spike scan done — {len(spikes)} spikes in {time.time()-start:.1f}s")
@@ -183,26 +204,6 @@ async def spike_loop(symbols: list[str]):
             await asyncio.sleep(0.3)
 
         await asyncio.sleep(max(0, SPIKE_INTERVAL - (time.time() - start)))
-
-
-async def main():
-    log.info("Fetching Binance Futures symbols...")
-    async with httpx.AsyncClient(timeout=20) as client:
-        symbols = await get_futures_symbols(client)
-        volumes = await get_24h_volume(client, symbols)
-
-    symbols = [s for s in symbols if volumes.get(s, 0) >= MIN_VOLUME_USDT]
-    symbols.sort(key=lambda s: volumes.get(s, 0), reverse=True)
-    log.info(f"Loaded {len(symbols)} symbols (>{MIN_VOLUME_USDT/1e6:.0f}M vol)")
-
-    await send_telegram(
-        f"Spike Bot started\n"
-        f"Scanning {len(symbols)} Binance Futures pairs\n"
-        f"Threshold: {SPIKE_THRESHOLD}%+ move on 1m / 5m / 15m\n"
-        f"Scan every {SPIKE_INTERVAL}s — cooldown {COOLDOWN_SEC//60}min per alert"
-    )
-
-    await spike_loop(symbols)
 
 
 if __name__ == "__main__":
